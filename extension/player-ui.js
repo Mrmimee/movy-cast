@@ -143,6 +143,18 @@
   let cachedSubResults = [];
   let subQueryDraft = '';
   let lastHref = location.href;
+  let discoverRetryTimer = null;
+
+  // Instant-open cache (eliminates 1-3s loading delay when clicking the cast button)
+  const uiCache = {
+    ready: false,
+    tabResp: null,
+    bridgeOnline: true,
+    ffmpegAvailable: false,
+    devices: [],
+    session: null,
+    playback: { position: 0, duration: 0, state: 'PLAYING', volume: 50 }
+  };
 
   // ---------- Helpers ----------
 
@@ -520,6 +532,8 @@
   function closePanel() {
     clearTimeout(autoCloseTimer);
     autoCloseTimer = null;
+    clearTimeout(discoverRetryTimer);
+    discoverRetryTimer = null;
     clearInterval(pollTimer);
     pollTimer = null;
     isSeeking = false;
@@ -535,6 +549,29 @@
   function scheduleAutoClose(ms = 1100) {
     clearTimeout(autoCloseTimer);
     autoCloseTimer = setTimeout(closePanel, ms);
+  }
+
+  async function refreshPanelCache() {
+    const [resp, snap] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_TAB_STATE' }).catch(() => null),
+      chrome.runtime.sendMessage({ type: 'BRIDGE_API', path: '/api/snapshot' }).catch(() => null)
+    ]);
+
+    if (resp) {
+      uiCache.tabResp = resp;
+      if (resp.sync) currentSync = resp.sync;
+    }
+    if (snap?.ok && snap.data) {
+      uiCache.bridgeOnline = true;
+      uiCache.ffmpegAvailable = Boolean(snap.data.ffmpegAvailable);
+      uiCache.devices = snap.data.devices || [];
+      uiCache.session = snap.data.session || null;
+    } else {
+      uiCache.bridgeOnline = false;
+      uiCache.devices = [];
+      uiCache.session = null;
+    }
+    uiCache.ready = true;
   }
 
   async function togglePanel(video) {
@@ -555,22 +592,25 @@
       panelHost.addEventListener(evt, e => e.stopPropagation());
     });
 
-    panelShadow.innerHTML = `<style>${PANEL_SHADOW_CSS}</style><div class="panel"><div class="body"><div class="muted">加载中…</div></div></div>`;
     playerRoot.appendChild(panelHost);
-
     document.addEventListener('pointerdown', onOutsidePointerDown, true);
     document.addEventListener('keydown', onDocKeyDown, true);
 
-    await renderPanel();
+    // 1. Instant 0ms render from memory cache (no blocking "loading..." stall)
+    paintPanelFromCache();
+
+    // 2. Non-blocking background refresh via single /api/snapshot call (~2ms)
+    renderPanel();
     pollTimer = setInterval(pollRemoteStatus, 2500);
   }
 
   async function pollRemoteStatus() {
-    if (!panelShadow) return;
+    if (!panelShadow || !uiCache.session) return;
     try {
       const st = await chrome.runtime.sendMessage({ type: 'BRIDGE_API', path: '/api/status' });
       if (!st?.ok || !st.data?.active) return;
       const d = st.data;
+      uiCache.playback = d;
       const seekBar = panelShadow.querySelector('#seek');
       const curEl = panelShadow.querySelector('#cur');
       const durEl = panelShadow.querySelector('#dur');
@@ -607,39 +647,42 @@
 
   async function renderPanel(statusMsg = '', autoSearchSubs = false) {
     if (!panelShadow) return;
-    const resp = await chrome.runtime.sendMessage({ type: 'GET_TAB_STATE' }).catch(() => null);
-    if (!resp) return;
+    await refreshPanelCache();
+    if (!panelShadow) return;
+    paintPanelFromCache(statusMsg, autoSearchSubs);
 
+    // If casting is active, update seek/volume asynchronously without blocking panel paint
+    if (uiCache.session) {
+      pollRemoteStatus();
+    }
+
+    // If bridge just woke up and SSDP discovery is still running in background, refresh once silently
+    if (uiCache.bridgeOnline && uiCache.devices.length === 0 && !discoverRetryTimer) {
+      discoverRetryTimer = setTimeout(() => {
+        discoverRetryTimer = null;
+        if (panelShadow) renderPanel();
+      }, 2400);
+    }
+  }
+
+  function paintPanelFromCache(statusMsg = '', autoSearchSubs = false) {
+    if (!panelShadow) return;
+    const resp = uiCache.tabResp || {};
     const state = resp.state || {};
     const meta = state.pageMeta || {};
     const title = meta.title && meta.title !== 'Movy Video' ? meta.title : 'Movy 视频';
-    const sync = resp.sync || { subtitleOffset: 0, audioOffset: 0, mode: 'subtitle' };
+    const sync = resp.sync || currentSync || { subtitleOffset: 0, audioOffset: 0, mode: 'subtitle' };
     currentSync = sync;
     const extSubEnabled = Boolean(state.extSubEnabled);
     const autoContinue = Boolean(resp.autoContinueCast);
     const hasStream = (state.streams || []).length > 0;
     const queryValue = subQueryDraft || buildDefaultQuery(meta);
 
-    let bridgeOnline = false;
-    let ffmpegAvailable = false;
-    let devices = [];
-    let session = null;
-    let playback = { position: 0, duration: 0, state: 'PLAYING', volume: 50 };
-
-    try {
-      const h = await chrome.runtime.sendMessage({ type: 'BRIDGE_API', path: '/api/health' });
-      if (h?.ok) {
-        bridgeOnline = true;
-        ffmpegAvailable = Boolean(h.data?.ffmpegAvailable);
-        session = h.data?.session || null;
-        const d = await chrome.runtime.sendMessage({ type: 'BRIDGE_API', path: '/api/devices' });
-        if (d?.ok) devices = d.data?.devices || [];
-        if (session) {
-          const st = await chrome.runtime.sendMessage({ type: 'BRIDGE_API', path: '/api/status' });
-          if (st?.ok && st.data?.active) playback = st.data;
-        }
-      }
-    } catch {}
+    const bridgeOnline = uiCache.bridgeOnline;
+    const ffmpegAvailable = uiCache.ffmpegAvailable;
+    const devices = uiCache.devices || [];
+    const session = uiCache.session;
+    const playback = uiCache.playback || { position: 0, duration: 0, state: 'PLAYING', volume: 50 };
 
     const isAudio = sync.mode === 'audio';
     const offsetVal = isAudio ? (sync.audioOffset || 0) : (sync.subtitleOffset || 0);
@@ -647,7 +690,7 @@
 
     let body = '';
 
-    if (!bridgeOnline) {
+    if (!bridgeOnline && uiCache.ready) {
       body += `<div class="notice">本地投屏桥接未就绪，请运行一次 <code>bridge/install-autostart.bat</code> 并刷新页面。</div>`;
     } else {
       body += `<div class="sec-head"><span>局域网电视</span><div class="links"><button class="link" data-act="manual">手动</button><button class="link" data-act="refresh">刷新</button></div></div>`;
@@ -655,7 +698,7 @@
         body += `<div class="row"><input id="manualIp" type="text" placeholder="http://192.168.x.x:端口/..." /><button class="btn-sm" data-act="add-manual">添加</button></div>`;
       }
       if (!devices.length) {
-        body += `<div class="muted">未发现电视，请确认与电脑在同一 Wi-Fi</div>`;
+        body += `<div class="muted">${uiCache.ready ? '正在搜索局域网电视，请确认与电脑在同一 Wi-Fi' : '搜索设备中…'}</div>`;
       } else {
         body += `<div class="list">` + devices.map(dev => {
           const casting = session && session.udn === dev.udn;
@@ -897,7 +940,16 @@
     if (subList) bindSubClicks(subList);
   }
 
-  // ---------- Lifecycle Observer ----------
+  // ---------- Lifecycle Observer (Debounced, Zero Main-Thread Jitter) ----------
+
+  let scanTimer = null;
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      scanForVideo();
+    }, 250);
+  }
 
   function scanForVideo() {
     if (location.href !== lastHref) {
@@ -909,14 +961,19 @@
     const video = findPrimaryVideo();
     if (!video) return;
     hookVideo(video);
-    ensureCastButton(video);
-    if (customCues.length) {
+
+    // Fast path: skip redundant style/rect reads when cast button is already mounted in place
+    if (!(castBtn && castBtn.isConnected && anchoredFsBtn && anchoredFsBtn.isConnected && castBtn.nextElementSibling === anchoredFsBtn)) {
+      ensureCastButton(video);
+    }
+
+    if (customCues.length && (!subHost || !subHost.isConnected)) {
       ensureSubHost(video);
       syncSubtitleVisualStyle(findPlayerRoot(video));
     }
   }
 
-  const observer = new MutationObserver(() => scanForVideo());
+  const observer = new MutationObserver(scheduleScan);
   observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
   window.addEventListener('resize', () => {
     if (castBtn && anchoredFsBtn) syncButtonWithFullscreen(castBtn, anchoredFsBtn);
@@ -925,22 +982,22 @@
   });
   document.addEventListener('fullscreenchange', () => {
     closePanel();
-    setTimeout(scanForVideo, 150);
+    setTimeout(() => {
+      const v = findPrimaryVideo();
+      if (v) ensureCastButton(v);
+    }, 150);
   });
-  setInterval(scanForVideo, 1500);
+  setInterval(scanForVideo, 2000);
   scanForVideo();
 
-  try {
-    const stateResp = await chrome.runtime.sendMessage({ type: 'GET_TAB_STATE' });
-    if (stateResp?.sync) {
-      currentSync = stateResp.sync;
-      const v = findPrimaryVideo();
-      if (v) {
-        if (currentSync.subtitleOffset) applyNativeTrackOffset(v, currentSync.subtitleOffset);
-        if (currentSync.mode === 'audio' && currentSync.audioOffset > 0) applyAudioDelay(v, currentSync.audioOffset);
-      }
+  // Warm up panel cache silently in background so first button click opens in 0ms
+  refreshPanelCache().then(() => {
+    const v = findPrimaryVideo();
+    if (v && currentSync) {
+      if (currentSync.subtitleOffset) applyNativeTrackOffset(v, currentSync.subtitleOffset);
+      if (currentSync.mode === 'audio' && currentSync.audioOffset > 0) applyAudioDelay(v, currentSync.audioOffset);
     }
-  } catch {}
+  }).catch(() => {});
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const video = findPrimaryVideo();

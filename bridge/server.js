@@ -1002,6 +1002,37 @@ function isLocalClient(req) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+async function queryPlaybackStatus(dev) {
+  let position = 0;
+  let duration = 0;
+  let state = 'UNKNOWN';
+  let volume = null;
+
+  await Promise.all([
+    sendSoap(dev.avControlUrl, dev.avServiceType, 'GetPositionInfo', '<InstanceID>0</InstanceID>')
+      .then(posXml => {
+        position = parseHms(extractXmlTag(posXml, 'RelTime'));
+        duration = parseHms(extractXmlTag(posXml, 'TrackDuration'));
+      })
+      .catch(() => {}),
+    sendSoap(dev.avControlUrl, dev.avServiceType, 'GetTransportInfo', '<InstanceID>0</InstanceID>')
+      .then(trXml => {
+        state = extractXmlTag(trXml, 'CurrentTransportState') || 'UNKNOWN';
+      })
+      .catch(() => {}),
+    dev.rcControlUrl
+      ? sendSoap(dev.rcControlUrl, dev.rcServiceType, 'GetVolume', '<InstanceID>0</InstanceID><Channel>Master</Channel>')
+          .then(volXml => {
+            const v = Number(extractXmlTag(volXml, 'CurrentVolume'));
+            if (!Number.isNaN(v)) volume = v;
+          })
+          .catch(() => {})
+      : Promise.resolve()
+  ]);
+
+  return { position, duration, state, volume };
+}
+
 const server = http.createServer(async (req, res) => {
   lastActivityAt = Date.now();
   const urlObj = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -1042,9 +1073,26 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (pathname === '/api/snapshot' && req.method === 'GET') {
+      // Instant response from memory (never block UI on SSDP discovery)
+      if (devices.size === 0) {
+        discoverDevices(2200).catch(() => {});
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        port: PORT,
+        ffmpegAvailable,
+        devices: Array.from(devices.values()),
+        session: currentSession
+      });
+    }
+
     if (pathname === '/api/devices' && req.method === 'GET') {
       const refresh = urlObj.searchParams.get('refresh') === '1';
-      const list = refresh || devices.size === 0 ? await discoverDevices(2200) : Array.from(devices.values());
+      const list = refresh ? await discoverDevices(2200) : Array.from(devices.values());
+      if (!refresh && devices.size === 0) {
+        discoverDevices(2200).catch(() => {});
+      }
       return sendJson(res, 200, { devices: list });
     }
 
@@ -1189,42 +1237,11 @@ const server = http.createServer(async (req, res) => {
       const dev = devices.get(currentSession.udn);
       if (!dev) return sendJson(res, 200, { active: false });
 
-      let position = 0;
-      let duration = 0;
-      let state = 'UNKNOWN';
-      let volume = null;
-
-      try {
-        const posXml = await sendSoap(dev.avControlUrl, dev.avServiceType, 'GetPositionInfo', '<InstanceID>0</InstanceID>');
-        position = parseHms(extractXmlTag(posXml, 'RelTime'));
-        duration = parseHms(extractXmlTag(posXml, 'TrackDuration'));
-      } catch {}
-
-      try {
-        const trXml = await sendSoap(dev.avControlUrl, dev.avServiceType, 'GetTransportInfo', '<InstanceID>0</InstanceID>');
-        state = extractXmlTag(trXml, 'CurrentTransportState') || 'UNKNOWN';
-      } catch {}
-
-      if (dev.rcControlUrl) {
-        try {
-          const volXml = await sendSoap(
-            dev.rcControlUrl,
-            dev.rcServiceType,
-            'GetVolume',
-            '<InstanceID>0</InstanceID><Channel>Master</Channel>'
-          );
-          const v = Number(extractXmlTag(volXml, 'CurrentVolume'));
-          if (!Number.isNaN(v)) volume = v;
-        } catch {}
-      }
-
+      const status = await queryPlaybackStatus(dev);
       return sendJson(res, 200, {
         active: true,
         session: currentSession,
-        position,
-        duration,
-        state,
-        volume
+        ...status
       });
     }
 

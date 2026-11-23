@@ -144,22 +144,23 @@ async function handleCast(udn) {
 
 async function refreshBridgeState(forceDiscover = false) {
   try {
-    const h = await bg({ type: 'BRIDGE_API', path: '/api/health' });
-    if (!h?.ok) throw new Error('offline');
+    const snap = await bg({
+      type: 'BRIDGE_API',
+      path: forceDiscover ? '/api/devices?refresh=1' : '/api/snapshot'
+    });
+    if (!snap?.ok) throw new Error('offline');
     bridgeOnline = true;
-    ffmpegAvailable = Boolean(h.data?.ffmpegAvailable);
-    activeSession = h.data?.session || null;
+    if (!forceDiscover) {
+      ffmpegAvailable = Boolean(snap.data?.ffmpegAvailable);
+      activeSession = snap.data?.session || null;
+    }
     $('bridgeDot').classList.add('online');
     $('offlineNotice').classList.add('hidden');
     $('devicesSection').classList.remove('hidden');
 
-    const d = await bg({
-      type: 'BRIDGE_API',
-      path: forceDiscover ? '/api/devices?refresh=1' : '/api/devices'
-    });
-    renderDevices(d?.ok ? d.data?.devices || [] : []);
+    renderDevices(snap.data?.devices || []);
     renderSyncUI();
-    await pollPlaybackStatus();
+    if (activeSession) pollPlaybackStatus();
   } catch {
     bridgeOnline = false;
     activeSession = null;

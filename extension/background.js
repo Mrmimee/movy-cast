@@ -229,14 +229,22 @@ function addSubtitle(tabId, url, headers, extraLabel = '') {
 }
 
 async function bridgeFetch(path, options = {}) {
-  await ensureBridgeRunning();
-  const res = await fetch(`${BRIDGE_BASE}${path}`, {
+  const reqInit = {
     ...options,
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {})
     }
-  });
+  };
+  let res;
+  try {
+    res = await fetch(`${BRIDGE_BASE}${path}`, reqInit);
+  } catch {
+    // Only spin up native host on actual connection failure (zero overhead when already running)
+    const started = await ensureBridgeRunning();
+    if (!started) throw new Error('Bridge offline');
+    res = await fetch(`${BRIDGE_BASE}${path}`, reqInit);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.error || `Bridge HTTP ${res.status}`);
