@@ -1,0 +1,7 @@
+# Machine-specific generated Native Messaging manifest (created by install-autostart.bat)
+bridge/com.movy.cast.json
+
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

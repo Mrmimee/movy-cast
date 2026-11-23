@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Movy Cast</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span id="bridgeDot" class="dot"></span>
+        <span class="brand-name">Movy Cast</span>
+      </div>
+      <button id="refreshBtn" class="icon-btn" title="刷新设备">刷新</button>
+    </header>
+
+    <section class="media-bar">
+      <div id="mediaTitle" class="media-title">未在支持的视频页</div>
+      <div class="media-badges">
+        <span id="streamBadge" class="badge">待识别</span>
+        <span id="subBadge" class="badge hidden">字幕</span>
+      </div>
+    </section>
+
+    <div id="offlineNotice" class="notice hidden">
+      首次使用请双击运行一次 <code>bridge/install-autostart.bat</code>，以后打开 movy.sx / cinejoy.pk 将自动启停，无需手动打开。
+    </div>
+
+    <section id="devicesSection" class="section">
+      <div class="section-head">
+        <span>局域网电视</span>
+        <button id="manualToggle" class="link-btn">手动添加</button>
+      </div>
+      <div id="manualBox" class="manual-box hidden">
+        <input id="manualInput" type="text" placeholder="输入电视 DLNA 描述地址 http://192.168.x.x:..." />
+        <button id="manualAddBtn" class="btn-sm">添加</button>
+      </div>
+      <div id="deviceList" class="device-list">
+        <div class="muted">搜索电视中…</div>
+      </div>
+    </section>
+
+    <section id="remoteSection" class="section hidden">
+      <div class="section-head">
+        <span id="castingLabel">正在投屏</span>
+        <label class="toggle-inline" title="切换下一集时自动续投到当前电视">
+          <input id="autoContinueChk" type="checkbox" />
+          <span>换集续投</span>
+        </label>
+      </div>
+      <div class="progress-wrap">
+        <input id="seekBar" type="range" min="0" max="100" value="0" />
+        <div class="time-row">
+          <span id="curTime">00:00</span>
+          <span id="durTime">00:00</span>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button id="playPauseBtn" class="btn">暂停</button>
+        <button id="stopBtn" class="btn danger">停止投屏</button>
+      </div>
+      <div class="vol-row">
+        <span class="muted">音量</span>
+        <input id="volBar" type="range" min="0" max="100" value="50" />
+        <span id="volVal" class="vol-val">50</span>
+      </div>
+    </section>
+
+    <details class="fold" id="syncFold">
+      <summary class="fold-summary">
+        <span>音画 / 字幕同步</span>
+        <span id="syncSummaryVal" class="muted">0.0s</span>
+      </summary>
+      <div class="fold-body">
+        <div class="mode-row">
+          <button id="modeSubBtn" class="seg active">字幕偏移</button>
+          <button id="modeAudioBtn" class="seg">音频延迟</button>
+        </div>
+        <button id="autoSyncBtn" class="btn-primary">一键自动校准字幕</button>
+        <div class="sync-controls">
+          <button id="offsetMinusBig" class="btn">-0.5</button>
+          <button id="offsetMinus" class="btn">-0.1</button>
+          <span id="offsetDisplay" class="offset-val">0.0s</span>
+          <button id="offsetPlus" class="btn">+0.1</button>
+          <button id="offsetPlusBig" class="btn">+0.5</button>
+          <button id="offsetReset" class="btn">归零</button>
+        </div>
+        <div id="syncHint" class="hint">网页端实时生效，投屏时自动同步修正。</div>
+      </div>
+    </details>
+
+    <details class="fold" id="subFold">
+      <summary class="fold-summary">
+        <span>插件中文字幕</span>
+        <label class="toggle-inline" id="extSubToggleWrap">
+          <input id="extSubToggle" type="checkbox" />
+          <span id="extSubLabel" class="muted">已关</span>
+        </label>
+      </summary>
+      <div class="fold-body" id="subFoldBody">
+        <div class="sub-search-row">
+          <input id="subQueryInput" type="text" placeholder="自动使用当前片名" />
+          <button id="subSearchBtn" class="btn-sm">搜索</button>
+        </div>
+        <div id="subResults" class="sub-results"></div>
+      </div>
+    </details>
+
+    <div id="toast" class="status-bar hidden"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
