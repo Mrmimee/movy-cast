@@ -408,33 +408,19 @@
     const exact = playerRoot.querySelector('#ButtonFullscreen');
     if (exact && exact.getBoundingClientRect().width >= 14) return exact;
 
-    const sel = '.art-control-fullscreen,[aria-label*="fullscreen" i],[title*="fullscreen" i],[aria-label*="full screen" i],[title*="full screen" i],[aria-label*="全屏"],[title*="全屏"],[data-plyr="fullscreen"],.vjs-fullscreen-control,[data-testid*="fullscreen" i],[class*="fullscreen" i]';
+    const sel = '.art-control-fullscreen,[aria-label*="fullscreen" i],[title*="fullscreen" i],[aria-label*="全屏"],[title*="全屏"],[data-plyr="fullscreen"],.vjs-fullscreen-control,[class*="fullscreen" i]';
     const hits = Array.from(playerRoot.querySelectorAll(sel)).filter(el => {
       if (el.dataset.movyCastBtn === '1') return false;
       const r = el.getBoundingClientRect();
       return r.width >= 16 && r.height >= 16 && r.width <= 84 && r.height <= 84;
     });
-    if (hits.length) {
-      hits.sort((a, b) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
-        return (rb.right + rb.bottom) - (ra.right + ra.bottom);
-      });
-      return hits[0];
-    }
-
-    // Fallback for players with obfuscated class names (e.g., cinejoy.pk embedded players)
-    const vRect = video.getBoundingClientRect();
-    if (vRect.width < 220 || vRect.height < 140) return null;
-    const geom = Array.from(playerRoot.querySelectorAll('button, [role="button"]')).filter(el => {
-      if (el.dataset.movyCastBtn === '1' || !el.querySelector('svg')) return false;
-      const r = el.getBoundingClientRect();
-      if (r.width < 18 || r.height < 18 || r.width > 64 || r.height > 64) return false;
-      return r.bottom >= vRect.bottom - 95 && r.top <= vRect.bottom + 12 && r.right >= vRect.right - 120;
+    if (!hits.length) return null;
+    hits.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (rb.right + rb.bottom) - (ra.right + ra.bottom);
     });
-    if (!geom.length) return null;
-    geom.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-    return geom[0];
+    return hits[0];
   }
 
   function detectRealIconColor(fsBtn, fsSvg) {

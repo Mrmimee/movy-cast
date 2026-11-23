@@ -8,18 +8,18 @@
     let t = String(raw || '').trim();
     if (!t) return '';
     t = t
-      .replace(/\s*[-|–—]\s*(?:Movy|Cinejoy).*$/i, '')
+      .replace(/\s*[-|–—]\s*Movy.*$/i, '')
       .replace(/^Watch\s+/i, '')
       .replace(/\s+(?:Online|Free|HD|Full Movie|TV Show|Movies & TV Shows).*$/i, '')
       .trim();
-    if (/^(?:movy|cinejoy)$/i.test(t) || /watch free movies/i.test(t)) return '';
+    if (/^movy$/i.test(t) || /watch free movies/i.test(t)) return '';
     return t;
   }
 
   function extractPageMeta() {
     const href = location.href;
     const path = location.pathname;
-    const isSeries = /\/(tv|series|show)\//i.test(path);
+    const isSeries = /\/tv\//i.test(path);
     const mediaType = isSeries ? 'series' : 'movie';
 
     const h1 = document.querySelector('h1');
@@ -43,7 +43,7 @@
     if (qsEp > 0) episode = qsEp;
 
     if (isSeries && (!season || !episode)) {
-      const pathSe = path.match(/\/(?:tv|series|show)\/[^/]+\/(\d+)\/(\d+)/i);
+      const pathSe = path.match(/\/tv\/\d+\/(\d+)\/(\d+)/i);
       if (pathSe) {
         season = Number(pathSe[1]);
         episode = Number(pathSe[2]);
@@ -63,7 +63,7 @@
       if (m) imdbId = m[0];
     }
 
-    const mediaKey = `${location.hostname}${path}${season ? `:s${season}` : ''}${episode ? `:e${episode}` : ''}`;
+    const mediaKey = `${path}${season ? `:s${season}` : ''}${episode ? `:e${episode}` : ''}`;
     return {
       mediaKey,
       meta: { title: title || 'Movy Video', mediaType, year, season, episode, imdbId }

@@ -75,7 +75,7 @@ async function ensureBridgeRunning() {
 }
 
 function isMovyUrl(url) {
-  return typeof url === 'string' && /^https?:\/\/(www\.)?(movy\.sx|cinejoy\.pk)(\/|$)/i.test(url);
+  return typeof url === 'string' && /^https?:\/\/(www\.)?movy\.sx(\/|$)/i.test(url);
 }
 
 function getMediaKeyFromUrl(url) {
@@ -83,7 +83,7 @@ function getMediaKeyFromUrl(url) {
     const u = new URL(url);
     const season = u.searchParams.get('season') || u.searchParams.get('s') || '';
     const episode = u.searchParams.get('episode') || u.searchParams.get('e') || '';
-    return `${u.hostname}${u.pathname}${season ? `:s${season}` : ''}${episode ? `:e${episode}` : ''}`;
+    return `${u.pathname}${season ? `:s${season}` : ''}${episode ? `:e${episode}` : ''}`;
   } catch {
     return url || 'default';
   }

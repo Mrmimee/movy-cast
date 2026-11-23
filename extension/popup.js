@@ -68,7 +68,7 @@ function renderExtSubToggle() {
 
 function renderMediaHeader() {
   if (!tabState || !tabState.isMovy) {
-    $('mediaTitle').textContent = '请先打开 movy.sx / cinejoy.pk 视频页';
+    $('mediaTitle').textContent = '请先打开 movy.sx 视频页';
     $('streamBadge').textContent = '未在站点';
     $('streamBadge').classList.remove('ready');
     $('subBadge').classList.add('hidden');

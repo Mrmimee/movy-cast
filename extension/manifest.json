@@ -3,7 +3,7 @@
   "name": "Movy Cast",
   "version": "1.0.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3vflgt2dy5ih8lkcIoesz3FuIHrA2Aq6qR/MU66NfshBQPjBj6h3PUzWFLRs50Ah0f+wLbWOlhSXDFrJUpbwbLYTGYGxrvqVNGTKv9dFFCRJKyyOz65sYrZNtLjuXPsFAL2aV0DQ/SCb4SEF+dFPlwniOhUjPos2M/fZnkqXvjGCfmSOlebHdo8h0GvmEz9rV/10nLW4xuOMX1guX2kemV3N0wV+FtIcdqGcapV5eNGK5K4Ldi1AQCBgZYiBO2OY91V38oTB9GeKqQ59DThwTKLRVFFYM3UEFuoMojYnN/VVENKhC+YW9gLJQen39SYmTIZuEbCHpLMFw7Qjl49tpwIDAQAB",
-  "description": "极简 movy.sx / cinejoy.pk 电视投屏（DLNA）、音画/字幕同步与中文字幕搜索插件",
+  "description": "极简 movy.sx 电视投屏（DLNA）、音画/字幕同步与中文字幕搜索插件",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -27,8 +27,6 @@
   "host_permissions": [
     "https://www.movy.sx/*",
     "https://movy.sx/*",
-    "https://www.cinejoy.pk/*",
-    "https://cinejoy.pk/*",
     "http://127.0.0.1:18923/*",
     "<all_urls>"
   ],
@@ -39,9 +37,7 @@
     {
       "matches": [
         "https://www.movy.sx/*",
-        "https://movy.sx/*",
-        "https://www.cinejoy.pk/*",
-        "https://cinejoy.pk/*"
+        "https://movy.sx/*"
       ],
       "js": [
         "content.js"
