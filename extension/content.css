@@ -1,14 +1,25 @@
 /* Minimal non-intrusive host styles (panel & subtitles live inside isolated Shadow DOM) */
 .movy-cast-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  background: transparent;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  color: #ffffff !important;
+  opacity: 1 !important;
+  filter: none !important;
   cursor: pointer;
   flex-shrink: 0;
-  opacity: 1;
   transition: transform 0.15s ease-out;
+}
+
+.movy-cast-btn svg {
+  display: block !important;
+  color: #ffffff !important;
+  stroke: #ffffff !important;
+  opacity: 1 !important;
 }
 
 .movy-cast-btn:hover {

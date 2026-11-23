@@ -9,13 +9,13 @@
   }
   if (!check || !check.isMovy) return;
 
-  // Balanced 2.35-unit stroke Cast SVG matching movy.sx fullscreen icon weight & pure white brightness
+  // Pure #ffffff Cast SVG matching movy.sx pure white player icons
   const CAST_SVG_HTML =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
     '<path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>' +
     '<path d="M2 12.2A7.8 7.8 0 0 1 9.8 20"/>' +
     '<path d="M2 16.1A3.9 3.9 0 0 1 5.9 20"/>' +
-    '<circle cx="2.5" cy="19.5" r="1.15" fill="currentColor" stroke="none"/>' +
+    '<circle cx="2.5" cy="19.5" r="1.2" fill="#ffffff" stroke="none"/>' +
     '</svg>';
 
   const PANEL_SHADOW_CSS = `
@@ -435,49 +435,28 @@
     return hits[0];
   }
 
-  function detectRealIconColor(fsBtn, fsSvg) {
-    // Inspect actual painted SVG shape first (often #ffffff even when parent button has dimmed text color)
-    const shape = fsSvg ? fsSvg.querySelector('path, rect, line, polyline, polygon, circle') : null;
-    if (shape) {
-      const sc = window.getComputedStyle(shape);
-      for (const candidate of [sc.stroke, sc.fill]) {
-        if (candidate && candidate !== 'none' && candidate !== 'rgb(0, 0, 0)' && candidate !== 'rgba(0, 0, 0, 0)') {
-          return candidate;
-        }
-      }
-    }
-    const c = window.getComputedStyle(fsSvg || fsBtn).color;
-    return c && c !== 'rgb(0, 0, 0)' ? c : '#ffffff';
-  }
-
   function syncButtonWithFullscreen(btn, fsBtn) {
     if (!btn || !fsBtn) return;
     const fsSvg = fsBtn.querySelector('svg');
     const castSvg = btn.querySelector('svg');
     if (!castSvg) return;
 
-    // Copy layout classes without inheriting dimmed opacity utility classes
-    if (fsBtn.className && typeof fsBtn.className === 'string') {
-      const hostClasses = fsBtn.className
-        .split(/\s+/)
-        .filter(c => c && !/^(opacity-|text-white\/|text-zinc-|text-neutral-|text-gray-)/.test(c));
-      btn.className = [...new Set([...hostClasses, 'movy-cast-btn'])].join(' ');
-    }
-
     const fsRect = fsBtn.getBoundingClientRect();
+    let iconW = 24;
+    let iconH = 24;
     if (fsSvg) {
       const sr = fsSvg.getBoundingClientRect();
-      if (sr.width >= 16 && sr.width <= 44 && sr.height >= 16 && sr.height <= 44) {
-        castSvg.style.width = `${Math.round(sr.width)}px`;
-        castSvg.style.height = `${Math.round(sr.height)}px`;
-      }
+      if (sr.width >= 16 && sr.width <= 44) iconW = Math.round(sr.width);
+      if (sr.height >= 16 && sr.height <= 44) iconH = Math.round(sr.height);
     } else if (fsRect.width >= 18 && fsRect.width <= 44) {
-      castSvg.style.width = `${Math.round(fsRect.width)}px`;
-      castSvg.style.height = `${Math.round(fsRect.height)}px`;
+      iconW = Math.round(fsRect.width);
+      iconH = Math.round(fsRect.height);
     }
 
-    btn.style.color = detectRealIconColor(fsBtn, fsSvg);
-    btn.style.opacity = '1';
+    castSvg.style.width = `${iconW}px`;
+    castSvg.style.height = `${iconH}px`;
+    btn.style.width = `${Math.max(iconW, Math.round(fsRect.width || iconW))}px`;
+    btn.style.height = `${Math.max(iconH, Math.round(fsRect.height || iconH))}px`;
   }
 
   function ensureCastButton(video) {
@@ -494,6 +473,7 @@
 
     const btn = document.createElement('button');
     btn.type = 'button';
+    btn.className = 'movy-cast-btn';
     btn.dataset.movyCastBtn = '1';
     btn.title = '投屏与字幕 (Movy Cast)';
     btn.setAttribute('aria-label', '投屏与字幕');
