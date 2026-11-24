@@ -34,8 +34,10 @@ function getLocalIPv4Addresses() {
   const ifaces = os.networkInterfaces();
   const list = [];
   for (const name of Object.keys(ifaces)) {
+    // Skip proxy TUN / virtual adapters (e.g. Clash/Mihomo Meta 198.18.x.x)
+    if (/^(meta|clash|mihomo|utun|tun\d|tailscale|vethernet)/i.test(name)) continue;
     for (const info of ifaces[name] || []) {
-      if (info.family === 'IPv4' && !info.internal) {
+      if (info.family === 'IPv4' && !info.internal && !/^198\.18\./.test(info.address)) {
         list.push({ name, address: info.address, netmask: info.netmask });
       }
     }
@@ -255,7 +257,8 @@ function discoverDevices(timeoutMs = 2500) {
 
     const searchTargets = [
       'urn:schemas-upnp-org:service:AVTransport:1',
-      'urn:schemas-upnp-org:device:MediaRenderer:1'
+      'urn:schemas-upnp-org:device:MediaRenderer:1',
+      'ssdp:all'
     ];
 
     for (const bindIp of bindList) {
@@ -278,6 +281,10 @@ function discoverDevices(timeoutMs = 2500) {
         sock.on('error', () => {});
 
         sock.bind(0, bindIp, () => {
+          if (bindIp !== '0.0.0.0') {
+            try { sock.setMulticastInterface(bindIp); } catch {}
+          }
+          try { sock.setMulticastTTL(4); } catch {}
           for (const st of searchTargets) {
             const payload = Buffer.from(
               [
