@@ -3,6 +3,8 @@
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
+const tls = require('tls');
 const dgram = require('dgram');
 const os = require('os');
 const crypto = require('crypto');
@@ -13,9 +15,19 @@ const PORT = Number(process.env.MOVY_CAST_PORT || 18923);
 const SSDP_ADDR = '239.255.255.250';
 const SSDP_PORT = 1900;
 
+// Persistent Keep-Alive connection pools for fast upstream segment fetching
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false });
+
 // Active state
 const devices = new Map(); // udn -> device info
-const proxyTokens = new Map(); // token -> { url, headers, type, subtitleOffset, audioOffset, createdAt }
+const proxyTokens = new Map(); // token -> { url, headers, type, subtitleOffset, audioOffset, playlistSeq, seqIndex, createdAt }
+const urlTokenCache = new Map(); // dedupKey -> token (prevents token bloat on repeated m3u8 reloads)
+const segmentCache = new Map(); // token -> { promise, buffer, contentType, status, size, at }
+let segmentCacheBytes = 0;
+const MAX_SEG_CACHE_ITEMS = 5;
+const MAX_SEG_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB ring cap
+const MAX_SINGLE_SEG_BYTES = 12 * 1024 * 1024; // skip prefetching huge non-HLS MP4s
 let currentSession = null; // { udn, title, mediaUrl, subtitleUrl, subtitleOffset, audioOffset, mode }
 let lastActivityAt = Date.now();
 
@@ -106,14 +118,196 @@ function parseHms(hms) {
 }
 
 function createToken(data) {
-  const token = crypto.randomBytes(12).toString('hex');
+  const dedupKey = `${data.type}|${data.url}|${data.subtitleOffset || 0}|${data.audioOffset || 0}`;
+  const existingTok = urlTokenCache.get(dedupKey);
+  if (existingTok && proxyTokens.has(existingTok)) {
+    const prev = proxyTokens.get(existingTok);
+    prev.createdAt = Date.now();
+    if (data.playlistSeq) {
+      prev.playlistSeq = data.playlistSeq;
+      prev.seqIndex = data.seqIndex;
+    }
+    return existingTok;
+  }
+
+  const token = crypto.randomBytes(10).toString('hex');
   proxyTokens.set(token, { ...data, createdAt: Date.now() });
+  urlTokenCache.set(dedupKey, token);
+
   // Prune old tokens (> 6 hours)
-  const cutoff = Date.now() - 6 * 3600 * 1000;
-  for (const [k, v] of proxyTokens.entries()) {
-    if (v.createdAt < cutoff) proxyTokens.delete(k);
+  if (proxyTokens.size > 4000) {
+    const cutoff = Date.now() - 6 * 3600 * 1000;
+    for (const [k, v] of proxyTokens.entries()) {
+      if (v.createdAt < cutoff) proxyTokens.delete(k);
+    }
+    for (const [dk, tk] of urlTokenCache.entries()) {
+      if (!proxyTokens.has(tk)) urlTokenCache.delete(dk);
+    }
   }
   return token;
+}
+
+// ---------- System Proxy Detection (Public Streams Only, LAN Always Direct) ----------
+
+let cachedSysProxy = { checkedAt: 0, proxy: null };
+let cachedProxyHttpsAgent = { key: '', agent: null };
+
+function isLanHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return (
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h === '::1' ||
+    /^192\.168\./.test(h) ||
+    /^10\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    /^169\.254\./.test(h) ||
+    /\.local$/.test(h)
+  );
+}
+
+function parseProxySpec(raw) {
+  if (!raw) return null;
+  let str = String(raw).trim();
+  // Windows ProxyServer may look like "http=127.0.0.1:7890;https=127.0.0.1:7890"
+  if (str.includes('=')) {
+    const map = {};
+    for (const part of str.split(';')) {
+      const [k, v] = part.split('=');
+      if (k && v) map[k.trim().toLowerCase()] = v.trim();
+    }
+    str = map.https || map.http || '';
+  }
+  if (!str) return null;
+  if (!/^https?:\/\//i.test(str)) str = `http://${str}`;
+  try {
+    const u = new URL(str);
+    if (!u.hostname || !u.port) return null;
+    return { host: u.hostname, port: Number(u.port) };
+  } catch {
+    return null;
+  }
+}
+
+function getSystemProxy() {
+  const now = Date.now();
+  if (now - cachedSysProxy.checkedAt < 15000) return cachedSysProxy.proxy;
+
+  let proxy = parseProxySpec(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy);
+  if (!proxy && process.platform === 'win32') {
+    try {
+      const reg = spawnSync(
+        'reg',
+        ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+        { encoding: 'utf8', timeout: 1500 }
+      );
+      const out = reg.stdout || '';
+      const enabled = /ProxyEnable\s+REG_DWORD\s+0x1/i.test(out);
+      if (enabled) {
+        const m = out.match(/ProxyServer\s+REG_SZ\s+(.+)/i);
+        if (m) proxy = parseProxySpec(m[1].trim());
+      }
+    } catch {}
+  }
+
+  cachedSysProxy = { checkedAt: now, proxy };
+  return proxy;
+}
+
+class ProxyHttpsAgent extends https.Agent {
+  constructor(proxy) {
+    super({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false });
+    this.proxy = proxy;
+  }
+  createConnection(options, cb) {
+    const sock = net.connect(this.proxy.port, this.proxy.host);
+    let done = false;
+    const fail = err => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      cb(err);
+    };
+    sock.once('error', fail);
+    sock.setTimeout(8000, () => fail(new Error('Proxy CONNECT timeout')));
+    sock.once('connect', () => {
+      const target = `${options.host}:${options.port || 443}`;
+      sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
+    });
+
+    let headerBuf = '';
+    const onData = chunk => {
+      headerBuf += chunk.toString('latin1');
+      const idx = headerBuf.indexOf('\r\n\r\n');
+      if (idx === -1) return;
+      sock.removeListener('data', onData);
+      sock.setTimeout(0);
+      const statusLine = headerBuf.slice(0, headerBuf.indexOf('\r\n'));
+      if (!/^HTTP\/1\.[01]\s+200\b/i.test(statusLine)) {
+        return fail(new Error(`Proxy CONNECT rejected: ${statusLine}`));
+      }
+      if (done) return;
+      done = true;
+      const tlsSock = tls.connect({
+        socket: sock,
+        servername: options.servername || options.host,
+        rejectUnauthorized: false
+      });
+      cb(null, tlsSock);
+    };
+    sock.on('data', onData);
+  }
+}
+
+function getProxyHttpsAgent(proxy) {
+  const key = `${proxy.host}:${proxy.port}`;
+  if (cachedProxyHttpsAgent.key !== key || !cachedProxyHttpsAgent.agent) {
+    cachedProxyHttpsAgent = { key, agent: new ProxyHttpsAgent(proxy) };
+  }
+  return cachedProxyHttpsAgent.agent;
+}
+
+function openUpstreamRequest(targetUrl, { method = 'GET', headers = {}, timeoutMs = 10000, useProxy = true } = {}, onResponse) {
+  const u = new URL(targetUrl);
+  const isHttps = u.protocol === 'https:';
+  const proxy = useProxy && !isLanHost(u.hostname) ? getSystemProxy() : null;
+
+  const finalHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    ...headers
+  };
+
+  if (proxy && !isHttps) {
+    // Plain HTTP over HTTP proxy
+    return http.request(
+      {
+        hostname: proxy.host,
+        port: proxy.port,
+        path: targetUrl,
+        method,
+        headers: { ...finalHeaders, Host: u.host },
+        agent: httpAgent,
+        timeout: timeoutMs
+      },
+      onResponse
+    );
+  }
+
+  const mod = isHttps ? https : http;
+  const agent = isHttps ? (proxy ? getProxyHttpsAgent(proxy) : httpsAgent) : httpAgent;
+  return mod.request(
+    {
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      method,
+      headers: finalHeaders,
+      agent,
+      timeout: timeoutMs,
+      rejectUnauthorized: false
+    },
+    onResponse
+  );
 }
 
 function decodeSubtitleBuffer(buf) {
@@ -142,33 +336,15 @@ function decodeSubtitleBuffer(buf) {
   }
 }
 
-function fetchText(targetUrl, headers = {}, timeoutMs = 8000, redirects = 5) {
+function fetchText(targetUrl, headers = {}, timeoutMs = 8000, redirects = 5, useProxy = true) {
   return new Promise((resolve, reject) => {
-    let u;
+    let req;
     try {
-      u = new URL(targetUrl);
-    } catch (err) {
-      return reject(err);
-    }
-    const mod = u.protocol === 'https:' ? https : http;
-    const req = mod.request(
-      {
-        hostname: u.hostname,
-        port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname + u.search,
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          ...headers
-        },
-        timeout: timeoutMs,
-        rejectUnauthorized: false
-      },
-      res => {
+      req = openUpstreamRequest(targetUrl, { method: 'GET', headers, timeoutMs, useProxy }, res => {
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
           res.resume();
           const nextUrl = new URL(res.headers.location, targetUrl).href;
-          return fetchText(nextUrl, headers, timeoutMs, redirects - 1).then(resolve, reject);
+          return fetchText(nextUrl, headers, timeoutMs, redirects - 1, useProxy).then(resolve, reject);
         }
         const chunks = [];
         res.on('data', c => chunks.push(c));
@@ -182,12 +358,20 @@ function fetchText(targetUrl, headers = {}, timeoutMs = 8000, redirects = 5) {
             finalUrl: targetUrl
           });
         });
-      }
-    );
+      });
+    } catch (err) {
+      return reject(err);
+    }
     req.on('timeout', () => {
       req.destroy(new Error('Request timeout'));
     });
-    req.on('error', reject);
+    req.on('error', err => {
+      // Seamless fallback to direct if system proxy refuses connection
+      if (useProxy && getSystemProxy() && !isLanHost(new URL(targetUrl).hostname)) {
+        return fetchText(targetUrl, headers, timeoutMs, redirects, false).then(resolve, reject);
+      }
+      reject(err);
+    });
     req.end();
   });
 }
@@ -799,10 +983,90 @@ async function searchChineseSubtitles({ title, year, mediaType, season, episode 
   return { query, subtitles: subs.slice(0, 15) };
 }
 
-// ---------- HLS Playlist Rewriting & Media Proxy ----------
+// ---------- HLS Playlist Rewriting, Ring Prefetch Cache & Media Proxy ----------
+
+function evictSegmentCacheIfNeeded() {
+  while (segmentCache.size > MAX_SEG_CACHE_ITEMS || segmentCacheBytes > MAX_SEG_CACHE_BYTES) {
+    const oldestKey = segmentCache.keys().next().value;
+    if (!oldestKey) break;
+    const item = segmentCache.get(oldestKey);
+    segmentCache.delete(oldestKey);
+    if (item && item.size) segmentCacheBytes = Math.max(0, segmentCacheBytes - item.size);
+  }
+}
+
+function prefetchSegment(token) {
+  if (!token || segmentCache.has(token)) return;
+  const entry = proxyTokens.get(token);
+  if (!entry || entry.type !== 'bin') return;
+
+  const slot = { promise: null, buffer: null, contentType: 'video/mp2t', status: 200, size: 0, at: Date.now() };
+  segmentCache.set(token, slot);
+
+  slot.promise = fetchText(entry.url, entry.headers || {}, 15000)
+    .then(result => {
+      if (result.status < 200 || result.status >= 300 || !result.buffer || result.buffer.length > MAX_SINGLE_SEG_BYTES) {
+        segmentCache.delete(token);
+        return null;
+      }
+      slot.buffer = result.buffer;
+      slot.size = result.buffer.length;
+      slot.status = result.status;
+      slot.contentType = result.headers['content-type'] || 'video/mp2t';
+      segmentCacheBytes += slot.size;
+      evictSegmentCacheIfNeeded();
+      return slot;
+    })
+    .catch(() => {
+      segmentCache.delete(token);
+      return null;
+    });
+}
+
+function prefetchAhead(entry, count = 3) {
+  if (!entry || !Array.isArray(entry.playlistSeq) || typeof entry.seqIndex !== 'number') return;
+  for (let offset = 1; offset <= count; offset++) {
+    const nextTok = entry.playlistSeq[entry.seqIndex + offset];
+    if (nextTok) prefetchSegment(nextTok);
+  }
+}
+
+function serveBufferedSegment(req, res, slot) {
+  const buf = slot.buffer;
+  const total = buf.length;
+  const rangeHeader = req.headers.range;
+
+  if (rangeHeader) {
+    const m = rangeHeader.match(/bytes=(\d*)-(\d*)/i);
+    if (m) {
+      const start = m[1] === '' ? Math.max(0, total - Number(m[2])) : Number(m[1]);
+      const end = m[2] === '' ? total - 1 : Math.min(total - 1, Number(m[2]));
+      if (start <= end && start < total) {
+        const slice = buf.subarray(start, end + 1);
+        res.writeHead(206, {
+          'Content-Type': slot.contentType,
+          'Content-Length': slice.length,
+          'Content-Range': `bytes ${start}-${end}/${total}`,
+          'Accept-Ranges': 'bytes',
+          'Access-Control-Allow-Origin': '*'
+        });
+        return res.end(req.method === 'HEAD' ? undefined : slice);
+      }
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type': slot.contentType,
+    'Content-Length': total,
+    'Accept-Ranges': 'bytes',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(req.method === 'HEAD' ? undefined : buf);
+}
 
 function rewriteM3u8(content, baseUrl, localBase, headers) {
   const lines = content.split(/\r?\n/);
+  const segmentSeq = [];
   const rewritten = lines.map(line => {
     const trimmed = line.trim();
     if (!trimmed) return line;
@@ -811,22 +1075,41 @@ function rewriteM3u8(content, baseUrl, localBase, headers) {
     if (trimmed.startsWith('#')) {
       return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
         const abs = new URL(uri, baseUrl).href;
-        const tok = createToken({ url: abs, headers, type: /\.m3u8(\?|$)/i.test(abs) ? 'hls' : 'bin' });
-        const ext = /\.m3u8(\?|$)/i.test(abs) ? '.m3u8' : '';
+        const isSub = /\.m3u8(\?|$)/i.test(abs);
+        const tok = createToken({ url: abs, headers, type: isSub ? 'hls' : 'key' });
+        const ext = isSub ? '.m3u8' : '';
         return `URI="${localBase}/proxy/media/${tok}${ext}"`;
       });
     }
 
     const abs = new URL(trimmed, baseUrl).href;
     const isSubPlaylist = /\.m3u8(\?|$)/i.test(abs);
-    const tok = createToken({ url: abs, headers, type: isSubPlaylist ? 'hls' : 'bin' });
+    const seqIndex = isSubPlaylist ? -1 : segmentSeq.length;
+    const tok = createToken({
+      url: abs,
+      headers,
+      type: isSubPlaylist ? 'hls' : 'bin',
+      playlistSeq: isSubPlaylist ? null : segmentSeq,
+      seqIndex
+    });
+    if (!isSubPlaylist) segmentSeq.push(tok);
     const ext = isSubPlaylist ? '.m3u8' : /\.ts(\?|$)/i.test(abs) ? '.ts' : '';
     return `${localBase}/proxy/media/${tok}${ext}`;
   });
+
+  // Warm up the first 2 segments immediately when a media playlist is fetched
+  if (segmentSeq.length > 0) {
+    prefetchSegment(segmentSeq[0]);
+    if (segmentSeq[1]) prefetchSegment(segmentSeq[1]);
+  }
   return rewritten.join('\n');
 }
 
 function handleMediaProxy(req, res, token) {
+  if (req.socket) {
+    try { req.socket.setNoDelay(true); } catch {}
+  }
+
   const entry = proxyTokens.get(token);
   if (!entry) {
     res.writeHead(404);
@@ -889,7 +1172,29 @@ function handleMediaProxy(req, res, token) {
     return;
   }
 
-  // Direct stream proxy (supports Range for MP4/TS seeking)
+  // Trigger lookahead prefetch for the next 3 HLS segments immediately
+  prefetchAhead(entry, 3);
+
+  // Serve directly from memory ring cache if this segment was prefetched
+  const cached = segmentCache.get(token);
+  if (cached) {
+    if (cached.buffer) {
+      return serveBufferedSegment(req, res, cached);
+    }
+    if (cached.promise) {
+      cached.promise.then(slot => {
+        if (res.writableEnded || res.destroyed) return;
+        if (slot && slot.buffer) {
+          serveBufferedSegment(req, res, slot);
+        } else {
+          pipeUpstream(entry.url, 5, true);
+        }
+      });
+      return;
+    }
+  }
+
+  // Direct Keep-Alive streaming proxy (supports Range for MP4/TS seeking, zero first-byte wait)
   const upstreamHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     ...(entry.headers || {})
@@ -898,41 +1203,45 @@ function handleMediaProxy(req, res, token) {
     upstreamHeaders.Range = req.headers.range;
   }
 
-  function pipeUpstream(targetUrl, redirects = 5) {
-    const u = new URL(targetUrl);
-    const mod = u.protocol === 'https:' ? https : http;
-    const upReq = mod.request(
-      {
-        hostname: u.hostname,
-        port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname + u.search,
-        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        headers: upstreamHeaders,
-        rejectUnauthorized: false
-      },
-      upRes => {
-        if ([301, 302, 303, 307, 308].includes(upRes.statusCode) && upRes.headers.location && redirects > 0) {
-          upRes.resume();
-          const next = new URL(upRes.headers.location, targetUrl).href;
-          return pipeUpstream(next, redirects - 1);
-        }
-        const respHeaders = {
-          'Access-Control-Allow-Origin': '*',
-          'Accept-Ranges': upRes.headers['accept-ranges'] || 'bytes'
-        };
-        if (upRes.headers['content-type']) respHeaders['Content-Type'] = upRes.headers['content-type'];
-        if (upRes.headers['content-length']) respHeaders['Content-Length'] = upRes.headers['content-length'];
-        if (upRes.headers['content-range']) respHeaders['Content-Range'] = upRes.headers['content-range'];
+  function pipeUpstream(targetUrl, redirects = 5, useProxy = true) {
+    let upReq;
+    try {
+      upReq = openUpstreamRequest(
+        targetUrl,
+        { method: req.method === 'HEAD' ? 'HEAD' : 'GET', headers: upstreamHeaders, timeoutMs: 20000, useProxy },
+        upRes => {
+          if ([301, 302, 303, 307, 308].includes(upRes.statusCode) && upRes.headers.location && redirects > 0) {
+            upRes.resume();
+            const next = new URL(upRes.headers.location, targetUrl).href;
+            return pipeUpstream(next, redirects - 1, useProxy);
+          }
+          const respHeaders = {
+            'Access-Control-Allow-Origin': '*',
+            'Accept-Ranges': upRes.headers['accept-ranges'] || 'bytes'
+          };
+          if (upRes.headers['content-type']) respHeaders['Content-Type'] = upRes.headers['content-type'];
+          if (upRes.headers['content-length']) respHeaders['Content-Length'] = upRes.headers['content-length'];
+          if (upRes.headers['content-range']) respHeaders['Content-Range'] = upRes.headers['content-range'];
 
-        res.writeHead(upRes.statusCode || 200, respHeaders);
-        if (req.method === 'HEAD') {
-          upRes.resume();
-          return res.end();
+          res.writeHead(upRes.statusCode || 200, respHeaders);
+          if (req.method === 'HEAD') {
+            upRes.resume();
+            return res.end();
+          }
+          upRes.pipe(res);
         }
-        upRes.pipe(res);
+      );
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end(`Upstream stream error: ${err.message}`);
       }
-    );
+      return;
+    }
     upReq.on('error', err => {
+      if (useProxy && !res.headersSent && getSystemProxy() && !isLanHost(new URL(targetUrl).hostname)) {
+        return pipeUpstream(targetUrl, redirects, false);
+      }
       if (!res.headersSent) {
         res.writeHead(502);
         res.end(`Upstream stream error: ${err.message}`);
@@ -1211,6 +1520,8 @@ const server = http.createServer(async (req, res) => {
       } else if (action === 'stop') {
         await sendSoap(dev.avControlUrl, dev.avServiceType, 'Stop', '<InstanceID>0</InstanceID>');
         currentSession = null;
+        segmentCache.clear();
+        segmentCacheBytes = 0;
       } else if (action === 'seek') {
         await sendSoap(
           dev.avControlUrl,
