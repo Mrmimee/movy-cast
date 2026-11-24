@@ -136,6 +136,8 @@ function isMediaUrl(url, contentType = '') {
 function isSubtitleUrl(url, contentType = '') {
   if (!url || !/^https?:\/\//i.test(url)) return false;
   if (/^http:\/\/127\.0\.0\.1:18923/i.test(url)) return false;
+  // Ignore video preview/thumbnail sprite VTTs (e.g. thumbs/thumbs.vtt)
+  if (/(?:thumbs?|thumbnails?|sprites?|storyboard|preview)/i.test(url)) return false;
   if (/\.(vtt|srt)(\?|$)/i.test(url)) return true;
   if (/text\/(vtt|srt)/i.test(contentType)) return true;
   return false;

@@ -1071,13 +1071,15 @@ function rewriteM3u8(content, baseUrl, localBase, headers) {
     const trimmed = line.trim();
     if (!trimmed) return line;
 
-    // Rewrite URI="..." inside tags like #EXT-X-KEY or #EXT-X-MEDIA
+    // Rewrite URI="..." inside tags like #EXT-X-KEY, #EXT-X-MAP (init.mp4), or #EXT-X-MEDIA
     if (trimmed.startsWith('#')) {
       return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
         const abs = new URL(uri, baseUrl).href;
         const isSub = /\.m3u8(\?|$)/i.test(abs);
-        const tok = createToken({ url: abs, headers, type: isSub ? 'hls' : 'key' });
-        const ext = isSub ? '.m3u8' : '';
+        const isInitMp4 = /\.mp4(\?|$)/i.test(abs);
+        const tok = createToken({ url: abs, headers, type: isSub ? 'hls' : isInitMp4 ? 'bin' : 'key' });
+        if (isInitMp4) prefetchSegment(tok);
+        const ext = isSub ? '.m3u8' : isInitMp4 ? '.mp4' : '';
         return `URI="${localBase}/proxy/media/${tok}${ext}"`;
       });
     }
@@ -1093,7 +1095,15 @@ function rewriteM3u8(content, baseUrl, localBase, headers) {
       seqIndex
     });
     if (!isSubPlaylist) segmentSeq.push(tok);
-    const ext = isSubPlaylist ? '.m3u8' : /\.ts(\?|$)/i.test(abs) ? '.ts' : '';
+    const ext = isSubPlaylist
+      ? '.m3u8'
+      : /\.m4s(\?|$)/i.test(abs)
+        ? '.m4s'
+        : /\.mp4(\?|$)/i.test(abs)
+          ? '.mp4'
+          : /\.ts(\?|$)/i.test(abs)
+            ? '.ts'
+            : '';
     return `${localBase}/proxy/media/${tok}${ext}`;
   });
 
