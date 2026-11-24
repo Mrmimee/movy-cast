@@ -61,11 +61,21 @@ function resolveFfmpegBin() {
   return '';
 }
 
+const activeTempFiles = new Set();
+
+function cleanupTempFiles() {
+  for (const f of activeTempFiles) {
+    try { fs.unlinkSync(f); } catch {}
+  }
+  activeTempFiles.clear();
+}
+
 function killAllFfmpegs() {
   for (const ff of activeFfmpegs) {
     try { ff.kill('SIGKILL'); } catch {}
   }
   activeFfmpegs.clear();
+  cleanupTempFiles();
 }
 
 let ffmpegBin = resolveFfmpegBin();
@@ -1157,11 +1167,14 @@ function handleMediaProxy(req, res, token) {
     return res.end('Token expired');
   }
 
-  // Lossless FFmpeg MPEG-TS remux mode (fixes fMP4/.m4s black screen on Hisense/domestic TVs; <2% CPU)
+  // Lossless FFmpeg remux mode: MKV with embedded SRT when subtitle is present, MPEG-TS otherwise (<2% CPU)
   if (entry.type === 'remux' && ffmpegAvailable) {
+    const isMkv = entry.container === 'mkv' && entry.tempSubPath && fs.existsSync(entry.tempSubPath);
+    const outMime = isMkv ? 'video/x-matroska' : 'video/mp2ts';
+
     if (req.method === 'HEAD') {
       res.writeHead(200, {
-        'Content-Type': 'video/mp2ts',
+        'Content-Type': outMime,
         'Access-Control-Allow-Origin': '*'
       });
       return res.end();
@@ -1170,22 +1183,45 @@ function handleMediaProxy(req, res, token) {
     const inputUrl = entry.localInputUrl || entry.url;
     const startSec = Math.max(0, Math.floor(Number(entry.startTime) || 0));
     const audioOff = Number(entry.audioOffset) || 0;
+    const hasAudioOffset = Math.abs(audioOff) >= 0.05;
     const ffArgs = ['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt'];
 
-    if (Math.abs(audioOff) >= 0.05) {
-      if (startSec > 0) ffArgs.push('-ss', String(startSec));
-      ffArgs.push('-i', inputUrl);
+    if (startSec > 0) ffArgs.push('-ss', String(startSec));
+    ffArgs.push('-i', inputUrl);
+
+    let audioInputIdx = 0;
+    let subInputIdx = -1;
+
+    if (hasAudioOffset) {
       if (startSec > 0) ffArgs.push('-ss', String(startSec));
       ffArgs.push('-itsoffset', String(audioOff), '-i', inputUrl);
-      ffArgs.push('-map', '0:v:0', '-map', '1:a:0?', '-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
+      audioInputIdx = 1;
+    }
+
+    if (isMkv) {
+      ffArgs.push('-sub_charenc', 'UTF-8', '-i', entry.tempSubPath);
+      subInputIdx = hasAudioOffset ? 2 : 1;
+    }
+
+    ffArgs.push('-map', '0:v:0', '-map', `${audioInputIdx}:a:0?`);
+    if (isMkv) {
+      ffArgs.push(
+        '-map', `${subInputIdx}:0`,
+        '-c:v', 'copy',
+        '-c:a', 'copy',
+        '-c:s', 'srt',
+        '-metadata:s:s:0', 'language=chi',
+        '-metadata:s:s:0', 'title=中文',
+        '-disposition:s:0', 'default+forced',
+        '-f', 'matroska',
+        'pipe:1'
+      );
     } else {
-      if (startSec > 0) ffArgs.push('-ss', String(startSec));
-      ffArgs.push('-i', inputUrl);
-      ffArgs.push('-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
+      ffArgs.push('-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
     }
 
     res.writeHead(200, {
-      'Content-Type': 'video/mp2ts',
+      'Content-Type': outMime,
       'Transfer-Encoding': 'chunked',
       'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'no-cache'
@@ -1414,6 +1450,22 @@ async function estimateHlsDurationSec(m3u8Url, headers) {
   }
 }
 
+async function prepareTempSubFile(subtitleUrl, headers, effectiveOffsetSec) {
+  if (!subtitleUrl) return '';
+  try {
+    const res = await fetchText(subtitleUrl, headers || {}, 8000);
+    if (res.status < 200 || res.status >= 300) return '';
+    const srt = convertAndShiftSubtitleToSrt(decodeSubtitleBuffer(res.buffer), effectiveOffsetSec);
+    if (!srt.trim()) return '';
+    const tmpPath = path.join(os.tmpdir(), `movy-cast-${crypto.randomBytes(6).toString('hex')}.srt`);
+    fs.writeFileSync(tmpPath, srt, 'utf8');
+    activeTempFiles.add(tmpPath);
+    return tmpPath;
+  } catch {
+    return '';
+  }
+}
+
 async function castMediaToDevice(dev, { mediaUrl, subtitleUrl, title, headers, subtitleOffset = 0, audioOffset = 0, startTime = 0, knownDuration = 0 }) {
   killAllFfmpegs();
 
@@ -1421,9 +1473,17 @@ async function castMediaToDevice(dev, { mediaUrl, subtitleUrl, title, headers, s
   const localBase = `http://${localIp}:${PORT}`;
   const isHls = /\.m3u8(\?|$)/i.test(mediaUrl);
   const useAudioOffset = Math.abs(Number(audioOffset) || 0) >= 0.05 && ffmpegAvailable;
-  // Automatically remux HLS to standard MPEG-TS when ffmpeg is installed (fixes fMP4/.m4s black screen on Hisense/domestic TVs)
-  const useRemux = ffmpegAvailable && (isHls || useAudioOffset);
   const resolvedStart = Math.max(0, Math.floor(Number(startTime) || 0));
+
+  // Prepare lossless embedded SRT file if a subtitle is selected and ffmpeg is installed
+  let tempSubPath = '';
+  if (ffmpegAvailable && subtitleUrl) {
+    tempSubPath = await prepareTempSubFile(subtitleUrl, headers, (Number(subtitleOffset) || 0) - resolvedStart);
+  }
+
+  // Remux to MKV (with embedded SRT) when subtitle is ready, or MPEG-TS for HLS/audio-offset
+  const useRemux = ffmpegAvailable && (isHls || useAudioOffset || Boolean(tempSubPath));
+  const container = tempSubPath ? 'mkv' : 'ts';
 
   let proxiedMediaUrl = '';
   let mimeType = 'video/mp4';
@@ -1444,12 +1504,14 @@ async function castMediaToDevice(dev, { mediaUrl, subtitleUrl, title, headers, s
       localInputUrl,
       headers: headers || {},
       type: 'remux',
+      container,
+      tempSubPath,
       startTime: resolvedStart,
       audioOffset: useAudioOffset ? Number(audioOffset) : 0,
       createdAt: Date.now()
     });
-    proxiedMediaUrl = `${localBase}/proxy/media/${remuxToken}.ts`;
-    mimeType = 'video/mp2ts';
+    proxiedMediaUrl = `${localBase}/proxy/media/${remuxToken}.${container}`;
+    mimeType = container === 'mkv' ? 'video/x-matroska' : 'video/mp2ts';
   } else {
     const mediaToken = createToken({
       url: mediaUrl,
