@@ -5,6 +5,8 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 const tls = require('tls');
+const fs = require('fs');
+const path = require('path');
 const dgram = require('dgram');
 const os = require('os');
 const crypto = require('crypto');
@@ -24,21 +26,50 @@ const devices = new Map(); // udn -> device info
 const proxyTokens = new Map(); // token -> { url, headers, type, subtitleOffset, audioOffset, playlistSeq, seqIndex, createdAt }
 const urlTokenCache = new Map(); // dedupKey -> token (prevents token bloat on repeated m3u8 reloads)
 const segmentCache = new Map(); // token -> { promise, buffer, contentType, status, size, at }
+const activeFfmpegs = new Set(); // track child processes for instant cleanup on stop/seek
 let segmentCacheBytes = 0;
 const MAX_SEG_CACHE_ITEMS = 5;
 const MAX_SEG_CACHE_BYTES = 32 * 1024 * 1024; // 32 MB ring cap
 const MAX_SINGLE_SEG_BYTES = 12 * 1024 * 1024; // skip prefetching huge non-HLS MP4s
-let currentSession = null; // { udn, title, mediaUrl, subtitleUrl, subtitleOffset, audioOffset, mode }
+let currentSession = null; // { udn, title, mediaUrl, subtitleUrl, subtitleOffset, audioOffset, remuxMode, remuxStartOffset, headers }
 let lastActivityAt = Date.now();
 
-// Detect ffmpeg availability once
-let ffmpegAvailable = false;
-try {
-  const res = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore', timeout: 2500 });
-  ffmpegAvailable = res.status === 0;
-} catch {
-  ffmpegAvailable = false;
+function resolveFfmpegBin() {
+  const candidates = ['ffmpeg'];
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    const wgBase = path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet');
+    candidates.push(path.join(wgBase, 'Links', 'ffmpeg.exe'));
+    const pkgsDir = path.join(wgBase, 'Packages');
+    try {
+      for (const pkg of fs.readdirSync(pkgsDir)) {
+        if (!/ffmpeg/i.test(pkg)) continue;
+        const pkgPath = path.join(pkgsDir, pkg);
+        for (const sub of fs.readdirSync(pkgPath)) {
+          const binPath = path.join(pkgPath, sub, 'bin', 'ffmpeg.exe');
+          if (fs.existsSync(binPath)) candidates.push(binPath);
+        }
+      }
+    } catch {}
+  }
+  for (const bin of candidates) {
+    try {
+      if (bin !== 'ffmpeg' && !fs.existsSync(bin)) continue;
+      const res = spawnSync(bin, ['-version'], { stdio: 'ignore', timeout: 2500 });
+      if (res.status === 0) return bin;
+    } catch {}
+  }
+  return '';
 }
+
+function killAllFfmpegs() {
+  for (const ff of activeFfmpegs) {
+    try { ff.kill('SIGKILL'); } catch {}
+  }
+  activeFfmpegs.clear();
+}
+
+let ffmpegBin = resolveFfmpegBin();
+let ffmpegAvailable = Boolean(ffmpegBin);
 
 // ---------- Utility Helpers ----------
 
@@ -1126,38 +1157,55 @@ function handleMediaProxy(req, res, token) {
     return res.end('Token expired');
   }
 
-  // Optional FFmpeg audio-offset remux mode
-  if (entry.audioOffset && Math.abs(entry.audioOffset) >= 0.05 && ffmpegAvailable) {
-    const ffArgs = ['-hide_banner', '-loglevel', 'error'];
-    const headerLines = [];
-    if (entry.headers?.referer) headerLines.push(`Referer: ${entry.headers.referer}`);
-    if (entry.headers?.origin) headerLines.push(`Origin: ${entry.headers.origin}`);
-    if (entry.headers?.['user-agent']) headerLines.push(`User-Agent: ${entry.headers['user-agent']}`);
-    const headerStr = headerLines.length ? headerLines.join('\r\n') + '\r\n' : '';
+  // Lossless FFmpeg MPEG-TS remux mode (fixes fMP4/.m4s black screen on Hisense/domestic TVs; <2% CPU)
+  if (entry.type === 'remux' && ffmpegAvailable) {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, {
+        'Content-Type': 'video/mp2ts',
+        'Access-Control-Allow-Origin': '*'
+      });
+      return res.end();
+    }
 
-    if (headerStr) ffArgs.push('-headers', headerStr);
-    ffArgs.push('-i', entry.url);
-    if (headerStr) ffArgs.push('-headers', headerStr);
-    ffArgs.push('-itsoffset', String(entry.audioOffset), '-i', entry.url);
-    ffArgs.push('-map', '0:v:0', '-map', '1:a:0?', '-c', 'copy', '-f', 'mpegts', 'pipe:1');
+    const inputUrl = entry.localInputUrl || entry.url;
+    const startSec = Math.max(0, Math.floor(Number(entry.startTime) || 0));
+    const audioOff = Number(entry.audioOffset) || 0;
+    const ffArgs = ['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt'];
+
+    if (Math.abs(audioOff) >= 0.05) {
+      if (startSec > 0) ffArgs.push('-ss', String(startSec));
+      ffArgs.push('-i', inputUrl);
+      if (startSec > 0) ffArgs.push('-ss', String(startSec));
+      ffArgs.push('-itsoffset', String(audioOff), '-i', inputUrl);
+      ffArgs.push('-map', '0:v:0', '-map', '1:a:0?', '-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
+    } else {
+      if (startSec > 0) ffArgs.push('-ss', String(startSec));
+      ffArgs.push('-i', inputUrl);
+      ffArgs.push('-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
+    }
 
     res.writeHead(200, {
-      'Content-Type': 'video/mp2t',
+      'Content-Type': 'video/mp2ts',
       'Transfer-Encoding': 'chunked',
-      'Access-Control-Allow-Origin': '*'
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
     });
 
-    const ff = spawn('ffmpeg', ffArgs);
+    const ff = spawn(ffmpegBin, ffArgs, { windowsHide: true });
+    activeFfmpegs.add(ff);
     ff.stdout.pipe(res);
+
+    const cleanup = () => {
+      activeFfmpegs.delete(ff);
+      try { ff.kill('SIGKILL'); } catch {}
+    };
+    ff.on('exit', () => activeFfmpegs.delete(ff));
     ff.on('error', () => {
+      cleanup();
       if (!res.headersSent) res.writeHead(500);
       res.end();
     });
-    req.on('close', () => {
-      try {
-        ff.kill('SIGKILL');
-      } catch {}
-    });
+    req.on('close', cleanup);
     return;
   }
 
@@ -1352,6 +1400,143 @@ async function queryPlaybackStatus(dev) {
   return { position, duration, state, volume };
 }
 
+async function estimateHlsDurationSec(m3u8Url, headers) {
+  try {
+    const res = await fetchText(m3u8Url, headers || {}, 6000);
+    if (res.status < 200 || res.status >= 300) return 0;
+    let total = 0;
+    for (const m of res.body.matchAll(/#EXTINF:([\d.]+)/gi)) {
+      total += parseFloat(m[1]) || 0;
+    }
+    return Math.floor(total);
+  } catch {
+    return 0;
+  }
+}
+
+async function castMediaToDevice(dev, { mediaUrl, subtitleUrl, title, headers, subtitleOffset = 0, audioOffset = 0, startTime = 0, knownDuration = 0 }) {
+  killAllFfmpegs();
+
+  const localIp = pickLocalIpForTarget(dev.host);
+  const localBase = `http://${localIp}:${PORT}`;
+  const isHls = /\.m3u8(\?|$)/i.test(mediaUrl);
+  const useAudioOffset = Math.abs(Number(audioOffset) || 0) >= 0.05 && ffmpegAvailable;
+  // Automatically remux HLS to standard MPEG-TS when ffmpeg is installed (fixes fMP4/.m4s black screen on Hisense/domestic TVs)
+  const useRemux = ffmpegAvailable && (isHls || useAudioOffset);
+  const resolvedStart = Math.max(0, Math.floor(Number(startTime) || 0));
+
+  let proxiedMediaUrl = '';
+  let mimeType = 'video/mp4';
+
+  if (useRemux) {
+    // Route FFmpeg input through our own local proxy so it inherits system proxy, Keep-Alive, and 3-segment prefetch cache
+    const srcToken = createToken({
+      url: mediaUrl,
+      headers: headers || {},
+      type: isHls ? 'hls' : 'bin'
+    });
+    const srcExt = isHls ? '.m3u8' : '.mp4';
+    const localInputUrl = `http://127.0.0.1:${PORT}/proxy/media/${srcToken}${srcExt}`;
+
+    const remuxToken = crypto.randomBytes(10).toString('hex');
+    proxyTokens.set(remuxToken, {
+      url: mediaUrl,
+      localInputUrl,
+      headers: headers || {},
+      type: 'remux',
+      startTime: resolvedStart,
+      audioOffset: useAudioOffset ? Number(audioOffset) : 0,
+      createdAt: Date.now()
+    });
+    proxiedMediaUrl = `${localBase}/proxy/media/${remuxToken}.ts`;
+    mimeType = 'video/mp2ts';
+  } else {
+    const mediaToken = createToken({
+      url: mediaUrl,
+      headers: headers || {},
+      type: isHls ? 'hls' : 'bin'
+    });
+    const ext = isHls ? '.m3u8' : '.mp4';
+    proxiedMediaUrl = `${localBase}/proxy/media/${mediaToken}${ext}`;
+    mimeType = isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+  }
+
+  let proxiedSubUrl = '';
+  if (subtitleUrl) {
+    const subToken = createToken({
+      url: subtitleUrl,
+      headers: headers || {},
+      type: 'sub',
+      subtitleOffset: Number(subtitleOffset) || 0
+    });
+    proxiedSubUrl = `${localBase}/proxy/subtitle/${subToken}.srt`;
+  }
+
+  const metadata = buildDidlMetadata({
+    title: title || 'Movy Video',
+    mediaUrl: proxiedMediaUrl,
+    mimeType,
+    subtitleUrl: proxiedSubUrl
+  });
+
+  try {
+    await sendSoap(dev.avControlUrl, dev.avServiceType, 'Stop', '<InstanceID>0</InstanceID>');
+  } catch {}
+
+  await sendSoap(
+    dev.avControlUrl,
+    dev.avServiceType,
+    'SetAVTransportURI',
+    `<InstanceID>0</InstanceID>` +
+      `<CurrentURI>${xmlEscape(proxiedMediaUrl)}</CurrentURI>` +
+      `<CurrentURIMetaData>${xmlEscape(metadata)}</CurrentURIMetaData>`
+  );
+
+  await sendSoap(
+    dev.avControlUrl,
+    dev.avServiceType,
+    'Play',
+    '<InstanceID>0</InstanceID><Speed>1</Speed>'
+  );
+
+  if (resolvedStart > 3 && !useRemux) {
+    setTimeout(() => {
+      sendSoap(
+        dev.avControlUrl,
+        dev.avServiceType,
+        'Seek',
+        `<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${formatHms(resolvedStart)}</Target>`
+      ).catch(() => {});
+    }, 1200);
+  }
+
+  currentSession = {
+    udn: dev.udn,
+    deviceName: dev.name,
+    title: title || 'Movy Video',
+    mediaUrl,
+    subtitleUrl: subtitleUrl || '',
+    subtitleOffset: Number(subtitleOffset) || 0,
+    audioOffset: Number(audioOffset) || 0,
+    headers: headers || {},
+    remuxMode: useRemux,
+    remuxStartOffset: useRemux ? resolvedStart : 0,
+    duration: knownDuration || 0,
+    startedAt: Date.now()
+  };
+
+  // Fill duration asynchronously for remuxed HLS streams so seek bar shows accurate total time
+  if (useRemux && isHls && !currentSession.duration) {
+    estimateHlsDurationSec(mediaUrl, headers).then(dur => {
+      if (currentSession && currentSession.mediaUrl === mediaUrl && dur > 0) {
+        currentSession.duration = dur;
+      }
+    }).catch(() => {});
+  }
+
+  return currentSession;
+}
+
 const server = http.createServer(async (req, res) => {
   lastActivityAt = Date.now();
   const urlObj = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -1430,90 +1615,16 @@ const server = http.createServer(async (req, res) => {
       if (!dev) return sendJson(res, 404, { error: 'TV device not found' });
       if (!mediaUrl) return sendJson(res, 400, { error: 'Missing mediaUrl' });
 
-      const localIp = pickLocalIpForTarget(dev.host);
-      const localBase = `http://${localIp}:${PORT}`;
-
-      const isHls = /\.m3u8(\?|$)/i.test(mediaUrl);
-      const useAudioOffset = Math.abs(Number(audioOffset) || 0) >= 0.05 && ffmpegAvailable;
-
-      const mediaToken = createToken({
-        url: mediaUrl,
-        headers: headers || {},
-        type: isHls ? 'hls' : 'bin',
-        audioOffset: useAudioOffset ? Number(audioOffset) : 0
-      });
-      const ext = useAudioOffset ? '.ts' : isHls ? '.m3u8' : '.mp4';
-      const proxiedMediaUrl = `${localBase}/proxy/media/${mediaToken}${ext}`;
-
-      let proxiedSubUrl = '';
-      if (subtitleUrl) {
-        const subToken = createToken({
-          url: subtitleUrl,
-          headers: headers || {},
-          type: 'sub',
-          subtitleOffset: Number(subtitleOffset) || 0
-        });
-        proxiedSubUrl = `${localBase}/proxy/subtitle/${subToken}.srt`;
-      }
-
-      const mimeType = useAudioOffset
-        ? 'video/mp2t'
-        : isHls
-          ? 'application/vnd.apple.mpegurl'
-          : 'video/mp4';
-
-      const metadata = buildDidlMetadata({
-        title: title || 'Movy Video',
-        mediaUrl: proxiedMediaUrl,
-        mimeType,
-        subtitleUrl: proxiedSubUrl
-      });
-
-      // Stop previous playback gracefully
-      try {
-        await sendSoap(dev.avControlUrl, dev.avServiceType, 'Stop', '<InstanceID>0</InstanceID>');
-      } catch {}
-
-      await sendSoap(
-        dev.avControlUrl,
-        dev.avServiceType,
-        'SetAVTransportURI',
-        `<InstanceID>0</InstanceID>` +
-          `<CurrentURI>${xmlEscape(proxiedMediaUrl)}</CurrentURI>` +
-          `<CurrentURIMetaData>${xmlEscape(metadata)}</CurrentURIMetaData>`
-      );
-
-      await sendSoap(
-        dev.avControlUrl,
-        dev.avServiceType,
-        'Play',
-        '<InstanceID>0</InstanceID><Speed>1</Speed>'
-      );
-
-      if (startTime > 3 && !useAudioOffset) {
-        setTimeout(() => {
-          sendSoap(
-            dev.avControlUrl,
-            dev.avServiceType,
-            'Seek',
-            `<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${formatHms(startTime)}</Target>`
-          ).catch(() => {});
-        }, 1200);
-      }
-
-      currentSession = {
-        udn: dev.udn,
-        deviceName: dev.name,
-        title: title || 'Movy Video',
+      const session = await castMediaToDevice(dev, {
         mediaUrl,
-        subtitleUrl: subtitleUrl || '',
-        subtitleOffset: Number(subtitleOffset) || 0,
-        audioOffset: Number(audioOffset) || 0,
-        headers: headers || {},
-        startedAt: Date.now()
-      };
-
-      return sendJson(res, 200, { ok: true, session: currentSession });
+        subtitleUrl,
+        title,
+        headers,
+        subtitleOffset,
+        audioOffset,
+        startTime
+      });
+      return sendJson(res, 200, { ok: true, session });
     }
 
     if (pathname === '/api/control' && req.method === 'POST') {
@@ -1529,16 +1640,31 @@ const server = http.createServer(async (req, res) => {
         await sendSoap(dev.avControlUrl, dev.avServiceType, 'Pause', '<InstanceID>0</InstanceID>');
       } else if (action === 'stop') {
         await sendSoap(dev.avControlUrl, dev.avServiceType, 'Stop', '<InstanceID>0</InstanceID>');
+        killAllFfmpegs();
         currentSession = null;
         segmentCache.clear();
         segmentCacheBytes = 0;
       } else if (action === 'seek') {
-        await sendSoap(
-          dev.avControlUrl,
-          dev.avServiceType,
-          'Seek',
-          `<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${formatHms(value)}</Target>`
-        );
+        if (currentSession && currentSession.remuxMode) {
+          // Remuxed MPEG-TS stream seeks by restarting FFmpeg cleanly at the target timestamp
+          await castMediaToDevice(dev, {
+            mediaUrl: currentSession.mediaUrl,
+            subtitleUrl: currentSession.subtitleUrl,
+            title: currentSession.title,
+            headers: currentSession.headers,
+            subtitleOffset: currentSession.subtitleOffset,
+            audioOffset: currentSession.audioOffset,
+            startTime: Number(value) || 0,
+            knownDuration: currentSession.duration || 0
+          });
+        } else {
+          await sendSoap(
+            dev.avControlUrl,
+            dev.avServiceType,
+            'Seek',
+            `<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>${formatHms(value)}</Target>`
+          );
+        }
       } else if (action === 'volume' && dev.rcControlUrl) {
         const vol = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
         await sendSoap(
@@ -1559,10 +1685,16 @@ const server = http.createServer(async (req, res) => {
       if (!dev) return sendJson(res, 200, { active: false });
 
       const status = await queryPlaybackStatus(dev);
+      const pos = currentSession.remuxMode
+        ? (currentSession.remuxStartOffset || 0) + (status.position || 0)
+        : status.position;
+      const dur = status.duration > 0 ? status.duration : (currentSession.duration || 0);
       return sendJson(res, 200, {
         active: true,
         session: currentSession,
-        ...status
+        ...status,
+        position: pos,
+        duration: dur
       });
     }
 
@@ -1637,6 +1769,10 @@ function startBridgeServer({ silent = false } = {}) {
     });
   });
 }
+
+process.on('exit', killAllFfmpegs);
+process.on('SIGINT', () => { killAllFfmpegs(); process.exit(0); });
+process.on('SIGTERM', () => { killAllFfmpegs(); process.exit(0); });
 
 if (require.main === module) {
   startBridgeServer({ silent: false }).catch(err => {
