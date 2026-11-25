@@ -78,8 +78,29 @@ function killAllFfmpegs() {
   cleanupTempFiles();
 }
 
+function resolveHwEncoder(bin) {
+  if (!bin) return 'libx264';
+  for (const enc of ['h264_nvenc', 'h264_qsv', 'h264_amf']) {
+    try {
+      const test = spawnSync(
+        bin,
+        ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x180:d=0.2:r=10', '-c:v', enc, '-f', 'null', '-'],
+        { stdio: 'ignore', timeout: 4000, windowsHide: true }
+      );
+      if (test.status === 0) return enc;
+    } catch {}
+  }
+  return 'libx264';
+}
+
+function escapeFfmpegFilterPath(filePath) {
+  // FFmpeg filtergraph requires forward slashes and escaped colons/quotes on Windows
+  return String(filePath).replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+}
+
 let ffmpegBin = resolveFfmpegBin();
 let ffmpegAvailable = Boolean(ffmpegBin);
+let videoEncoder = resolveHwEncoder(ffmpegBin);
 
 // ---------- Utility Helpers ----------
 
@@ -1167,9 +1188,10 @@ function handleMediaProxy(req, res, token) {
     return res.end('Token expired');
   }
 
-  // Lossless FFmpeg remux mode: MKV with embedded SRT when subtitle is present, MPEG-TS otherwise (<2% CPU)
+  // FFmpeg remux / GPU-accelerated Chinese subtitle burn-in mode
   if (entry.type === 'remux' && ffmpegAvailable) {
-    const isMkv = entry.container === 'mkv' && entry.tempSubPath && fs.existsSync(entry.tempSubPath);
+    const hasSub = Boolean(entry.tempSubPath && fs.existsSync(entry.tempSubPath));
+    const isMkv = entry.container === 'mkv' || hasSub;
     const outMime = isMkv ? 'video/x-matroska' : 'video/mp2ts';
 
     if (req.method === 'HEAD') {
@@ -1190,32 +1212,32 @@ function handleMediaProxy(req, res, token) {
     ffArgs.push('-i', inputUrl);
 
     let audioInputIdx = 0;
-    let subInputIdx = -1;
-
     if (hasAudioOffset) {
       if (startSec > 0) ffArgs.push('-ss', String(startSec));
       ffArgs.push('-itsoffset', String(audioOff), '-i', inputUrl);
       audioInputIdx = 1;
     }
 
-    if (isMkv) {
-      ffArgs.push('-sub_charenc', 'UTF-8', '-i', entry.tempSubPath);
-      subInputIdx = hasAudioOffset ? 2 : 1;
-    }
-
     ffArgs.push('-map', '0:v:0', '-map', `${audioInputIdx}:a:0?`);
-    if (isMkv) {
-      ffArgs.push(
-        '-map', `${subInputIdx}:0`,
-        '-c:v', 'copy',
-        '-c:a', 'copy',
-        '-c:s', 'srt',
-        '-metadata:s:s:0', 'language=chi',
-        '-metadata:s:s:0', 'title=中文',
-        '-disposition:s:0', 'default+forced',
-        '-f', 'matroska',
-        'pipe:1'
-      );
+
+    if (hasSub) {
+      // Burn cinema-styled Simplified Chinese subtitles directly into video via hardware encoder (100% TV compatible)
+      const escapedSub = escapeFfmpegFilterPath(entry.tempSubPath);
+      const style =
+        'FontName=Microsoft YaHei,FontSize=21,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,' +
+        'BackColour=&H80000000,BorderStyle=1,Outline=1.6,Shadow=0.8,MarginV=22';
+      ffArgs.push('-vf', `subtitles='${escapedSub}':charenc=UTF-8:force_style='${style}'`);
+
+      if (videoEncoder === 'h264_nvenc') {
+        ffArgs.push('-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'll', '-rc', 'vbr', '-cq', '22', '-b:v', '6M', '-maxrate', '10M', '-bufsize', '12M', '-pix_fmt', 'yuv420p');
+      } else if (videoEncoder === 'h264_qsv') {
+        ffArgs.push('-c:v', 'h264_qsv', '-preset', 'veryfast', '-global_quality', '22', '-pix_fmt', 'nv12');
+      } else if (videoEncoder === 'h264_amf') {
+        ffArgs.push('-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '22', '-qp_p', '22');
+      } else {
+        ffArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p');
+      }
+      ffArgs.push('-c:a', 'copy', '-f', 'matroska', 'pipe:1');
     } else {
       ffArgs.push('-c', 'copy', '-mpegts_flags', '+initial_discontinuity', '-f', 'mpegts', 'pipe:1');
     }
@@ -1634,6 +1656,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         port: PORT,
         ffmpegAvailable,
+        videoEncoder,
         deviceCount: devices.size,
         session: currentSession
       });
