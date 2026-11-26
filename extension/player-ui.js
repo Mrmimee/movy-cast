@@ -1031,6 +1031,22 @@
       return;
     }
 
+    if (msg.type === 'SYNC_VIDEO_PROGRESS') {
+      // Silently mirror TV playback progress back to paused browser <video> so movy.sx saves account watch history
+      if (video && video.paused && typeof msg.position === 'number' && msg.position > 0) {
+        const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : (msg.duration || 0);
+        const targetPos = dur > 5 ? Math.min(msg.position, Math.floor(dur - 2)) : msg.position;
+        if (targetPos > 0 && Math.abs(video.currentTime - targetPos) >= 2) {
+          try {
+            video.currentTime = targetPos;
+            video.dispatchEvent(new Event('timeupdate'));
+          } catch {}
+        }
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (msg.type === 'PAUSE_VIDEO' && video && !video.paused) {
       try { video.pause(); } catch {}
     }

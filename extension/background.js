@@ -314,6 +314,73 @@ async function saveSync(mediaKey, sync) {
   await chrome.storage.local.set({ syncMap: map });
 }
 
+// ---------- TV -> Browser Progress Sync (writes back to movy.sx account watch history) ----------
+
+let progressSyncTimer = null;
+let progressSyncTarget = null; // { tabId, mediaUrl, lastSyncedPos, startedAt, stoppedCount }
+
+function stopProgressSync() {
+  if (progressSyncTimer) {
+    clearInterval(progressSyncTimer);
+    progressSyncTimer = null;
+  }
+  progressSyncTarget = null;
+}
+
+async function syncTvProgressOnce(force = false) {
+  const target = progressSyncTarget;
+  if (!target) return;
+  const st = tabStates.get(target.tabId);
+  if (!st || !st.isMovy) {
+    stopProgressSync();
+    return;
+  }
+
+  try {
+    const status = await bridgeFetch('/api/status');
+    if (!status || !status.active || !status.session) {
+      if (Date.now() - target.startedAt > 20000) stopProgressSync();
+      return;
+    }
+    if (status.session.mediaUrl !== target.mediaUrl) {
+      stopProgressSync();
+      return;
+    }
+
+    const pos = Math.floor(Number(status.position) || 0);
+    const dur = Math.floor(Number(status.duration) || 0);
+    if (pos > 0 && (force || Math.abs(pos - target.lastSyncedPos) >= 3)) {
+      target.lastSyncedPos = pos;
+      await chrome.tabs.sendMessage(target.tabId, {
+        type: 'SYNC_VIDEO_PROGRESS',
+        position: pos,
+        duration: dur
+      }).catch(() => {});
+    }
+
+    if (status.state === 'STOPPED' && Date.now() - target.startedAt > 20000) {
+      target.stoppedCount++;
+      if (target.stoppedCount >= 2) stopProgressSync();
+    } else {
+      target.stoppedCount = 0;
+    }
+  } catch {}
+}
+
+function startProgressSync(tabId, mediaUrl, initialPos = 0) {
+  stopProgressSync();
+  progressSyncTarget = {
+    tabId,
+    mediaUrl,
+    lastSyncedPos: Math.floor(Number(initialPos) || 0),
+    startedAt: Date.now(),
+    stoppedCount: 0
+  };
+  progressSyncTimer = setInterval(() => {
+    syncTvProgressOnce(false).catch(() => {});
+  }, 15000);
+}
+
 async function castForTab(tabId, { udn, mediaUrl, subtitleUrl, startTime }) {
   const st = tabStates.get(tabId);
   if (!st) throw new Error('当前页面未检测到视频');
@@ -361,6 +428,7 @@ async function castForTab(tabId, { udn, mediaUrl, subtitleUrl, startTime }) {
   });
 
   await chrome.storage.local.set({ lastDeviceUdn: udn });
+  startProgressSync(tabId, stream.url, resolvedStart);
   return result;
 }
 
@@ -403,6 +471,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  if (progressSyncTarget && progressSyncTarget.tabId === tabId) {
+    stopProgressSync();
+  }
   tabStates.delete(tabId);
   disconnectNativeIfNoMovyTabs();
 });
@@ -557,6 +628,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     if (msg.type === 'BRIDGE_API') {
+      // Flush final TV playback progress back to browser before stopping cast
+      if (msg.path === '/api/control' && msg.body?.action === 'stop') {
+        await syncTvProgressOnce(true).catch(() => {});
+        stopProgressSync();
+      }
       const data = await bridgeFetch(msg.path, {
         method: msg.method || 'GET',
         body: msg.body ? JSON.stringify(msg.body) : undefined
