@@ -485,6 +485,12 @@ async function inspectDeviceLocation(locationUrl) {
       rcServiceType,
       lastSeen: Date.now()
     };
+    // Deduplicate same TV (same host + friendlyName) when it restarts with a new random port/UDN
+    for (const [oldUdn, oldDev] of devices.entries()) {
+      if (oldUdn !== udn && oldDev.host === device.host && oldDev.name === device.name) {
+        devices.delete(oldUdn);
+      }
+    }
     devices.set(udn, device);
     return device;
   } catch {
@@ -493,6 +499,7 @@ async function inspectDeviceLocation(locationUrl) {
 }
 
 function discoverDevices(timeoutMs = 2500) {
+  const scanStartedAt = Date.now();
   return new Promise(resolve => {
     const seenLocations = new Set();
     const sockets = [];
@@ -550,8 +557,14 @@ function discoverDevices(timeoutMs = 2500) {
           s.close();
         } catch {}
       }
-      // Give in-flight XML fetches a tiny grace period
+      // Give in-flight XML fetches a tiny grace period, then prune stale offline entries
       setTimeout(() => {
+        for (const [udn, dev] of devices.entries()) {
+          const isCasting = currentSession && currentSession.udn === udn;
+          if (!isCasting && dev.lastSeen < scanStartedAt) {
+            devices.delete(udn);
+          }
+        }
         resolve(Array.from(devices.values()));
       }, 300);
     }, timeoutMs);
